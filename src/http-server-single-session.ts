@@ -712,19 +712,26 @@ export class SingleSessionHTTPServer {
     });
 
     // MCP information endpoint (no auth required for discovery) and SSE support
-    app.get('/mcp', async (req, res) => {
-      // Handle StreamableHTTP transport requests with new pattern
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (sessionId && this.transports[sessionId]) {
-        // Let the StreamableHTTPServerTransport handle the GET request
-        try {
-          await this.transports[sessionId].handleRequest(req, res, undefined);
-          return;
-        } catch (error) {
-          logger.error('StreamableHTTP GET request failed:', error);
-          // Fall through to standard response
-        }
-      }
+app.get('/mcp', async (req, res) => {
+  // Handle StreamableHTTP transport requests with new pattern
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+  if (sessionId && this.transports[sessionId]) {
+    try {
+      await this.transports[sessionId].handleRequest(req, res, undefined);
+      return;
+    } catch (error) {
+      logger.error('StreamableHTTP GET request failed:', error);
+    }
+  }
+
+  // Fall through to standard response
+  res.json({
+    protocol_version: '2024-11-20',
+    tool_configuration: {},
+    tools: await this.session.describe(),
+  });
+});
       
       // Check Accept header for text/event-stream (SSE support)
       const accept = req.headers.accept;
@@ -862,23 +869,114 @@ export class SingleSessionHTTPServer {
 
 
     // Main MCP endpoint with authentication
-    app.post('/mcp', jsonParser, async (req: express.Request, res: express.Response): Promise<void> => {
-      // Log comprehensive debug info about the request
-      logger.info('POST /mcp request received - DETAILED DEBUG', {
-        headers: req.headers,
-        readable: req.readable,
-        readableEnded: req.readableEnded,
-        complete: req.complete,
-        bodyType: typeof req.body,
-        bodyContent: req.body ? JSON.stringify(req.body, null, 2) : 'undefined',
-        contentLength: req.get('content-length'),
-        contentType: req.get('content-type'),
-        userAgent: req.get('user-agent'),
-        ip: req.ip,
-        method: req.method,
-        url: req.url,
-        originalUrl: req.originalUrl
+// Main MCP endpoint with authentication (Claude-compatible)
+app.post('/mcp', jsonParser, async (req: express.Request, res: express.Response): Promise<void> => {
+  logger.info('POST /mcp request received - DETAILED DEBUG', {
+    headers: req.headers,
+    readable: req.readable,
+    readableEnded: req.readableEnded,
+    complete: req.complete,
+    bodyType: typeof req.body,
+    bodyContent: req.body ? JSON.stringify(req.body, null, 2) : 'undefined',
+    contentLength: req.get('content-length'),
+    contentType: req.get('content-type'),
+    userAgent: req.get('user-agent'),
+    ip: req.ip,
+    method: req.method,
+    url: req.url,
+    originalUrl: req.originalUrl
+  });
+
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+  if (typeof req.on === 'function') {
+    const closeHandler = () => {
+      if (!res.headersSent && sessionId) {
+        logger.info('Connection closed before response sent', { sessionId });
+        setImmediate(() => {
+          if (this.sessionMetadata[sessionId]) {
+            const metadata = this.sessionMetadata[sessionId];
+            const timeSinceAccess = Date.now() - metadata.lastAccess.getTime();
+            if (timeSinceAccess > 60000) {
+              this.removeSession(sessionId, 'connection_closed').catch(err => {
+                logger.error('Error during connection close cleanup', { error: err });
+              });
+            }
+          }
+        });
+      }
+    };
+    req.on('close', closeHandler);
+    res.on('finish', () => {
+      req.removeListener('close', closeHandler);
+    });
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    logger.warn('Authentication failed', {
+      reason: !authHeader ? 'no_auth_header' : 'invalid_auth_format',
+      ip: req.ip,
+      userAgent: req.get('user-agent')
+    });
+    res.status(401).json({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: 'Unauthorized' },
+      id: req.body?.id ?? null
+    });
+    return;
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (token !== this.authToken) {
+    logger.warn('Authentication failed: Invalid token', {
+      ip: req.ip,
+      userAgent: req.get('user-agent')
+    });
+    res.status(401).json({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: 'Unauthorized' },
+      id: req.body?.id ?? null
+    });
+    return;
+  }
+
+  logger.info('Authentication successful - proceeding to handleRequest', {
+    hasSession: !!this.session,
+    sessionType: this.session?.isSSE ? 'SSE' : 'StreamableHTTP',
+    sessionInitialized: this.session?.initialized
+  });
+
+  try {
+    await this.handleRequest(req, res);
+
+    if (!res.headersSent) {
+      logger.warn('No response sent by transport - sending fallback MCP JSON-RPC error');
+      res.status(200).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32603,
+          message: 'No response from transport (Claude fallback)'
+        },
+        id: req.body?.id ?? null
       });
+    }
+  } catch (err) {
+    logger.error('POST /mcp fatal error', { err });
+    if (!res.headersSent) {
+      res.status(200).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32603,
+          message: 'Internal error during request handling'
+        },
+        id: req.body?.id ?? null
+      });
+    }
+  }
+
+  logger.info('POST /mcp completed');
+});
       
       // Handle connection close to immediately clean up sessions
       const sessionId = req.headers['mcp-session-id'] as string | undefined;
